@@ -228,8 +228,8 @@ impl NetworkConfigs {
             });
         }
         if let Some(upgrade) = self.base {
-            // Mirrors `BasePrecompiles::install_with_observer` for the Cobalt
-            // upgrade in base/base/crates/common/precompiles/src/provider.rs.
+            // Mirrors `BasePrecompiles::install_with_observer` in
+            // `base/base/crates/common/precompiles/src/provider.rs`.
             // The Beryl-and-later singletons plus the versioned B-20 prefix
             // dispatcher, and the Cobalt-and-later precompiles below.
             // `BerylLookup::install` owns the dispatcher and threads the Base
@@ -239,24 +239,28 @@ impl NetworkConfigs {
             //
             // Factory/policy take a no-op observer: metrics observation is
             // scoped to the B-20 token call path, which anvil does not wire up.
-            let admin = Some(self.base_activation_admin());
-            B20Factory::install_with_observer(precompiles, upgrade, NoopPrecompileCallObserver);
-            BerylLookup::install(precompiles, upgrade);
-            PolicyRegistryPrecompile::install(precompiles, upgrade);
-            // Cobalt moves the activation registry onto its state-backed admin
-            // path (the admin storage slot, falling back to the static config
-            // admin while unset), matching `ActivationAdminConfig::new(admin,
-            // upgrade >= Cobalt)` in base/base.
-            ActivationRegistry::install_with_config(
-                precompiles,
-                ActivationAdminConfig::state_backed(admin),
-                upgrade,
-            );
-            // Cobalt adds the transaction-context and nonce-manager singleton
-            // precompiles. Neither is observed, by design (metrics are scoped to
-            // the B-20 token call path).
-            TxContext::install(precompiles, upgrade);
-            NonceManager::install(precompiles, upgrade);
+            if upgrade >= BaseUpgrade::Beryl {
+                let admin = Some(self.base_activation_admin());
+                B20Factory::install_with_observer(precompiles, upgrade, NoopPrecompileCallObserver);
+                BerylLookup::install(precompiles, upgrade);
+                PolicyRegistryPrecompile::install(precompiles, upgrade);
+                // Cobalt moves the activation registry onto its state-backed admin
+                // path (the admin storage slot, falling back to the static config
+                // admin while unset), matching `ActivationAdminConfig::new(admin,
+                // upgrade >= Cobalt)` in base/base.
+                ActivationRegistry::install_with_config(
+                    precompiles,
+                    ActivationAdminConfig::new(admin, upgrade >= BaseUpgrade::Cobalt),
+                    upgrade,
+                );
+            }
+            if upgrade >= BaseUpgrade::Cobalt {
+                // Cobalt adds the transaction-context and nonce-manager singleton
+                // precompiles. Neither is observed, by design (metrics are scoped to
+                // the B-20 token call path).
+                TxContext::install(precompiles, upgrade);
+                NonceManager::install(precompiles, upgrade);
+            }
         }
     }
 
@@ -266,12 +270,17 @@ impl NetworkConfigs {
         if self.celo {
             labels.insert(CELO_TRANSFER_ADDRESS, CELO_TRANSFER_LABEL.to_string());
         }
-        if self.is_base() {
-            labels.insert(BASE_TOKEN_FACTORY_ADDRESS, "BaseTokenFactory".to_string());
-            labels.insert(BASE_POLICY_REGISTRY_ADDRESS, "BasePolicyRegistry".to_string());
-            labels.insert(ActivationRegistryStorage::ADDRESS, "BaseActivationRegistry".to_string());
-            labels.insert(BASE_TX_CONTEXT_ADDRESS, "BaseTxContext".to_string());
-            labels.insert(BASE_NONCE_MANAGER_ADDRESS, "BaseNonceManager".to_string());
+        if let Some(upgrade) = self.base {
+            if upgrade >= BaseUpgrade::Beryl {
+                labels.insert(BASE_TOKEN_FACTORY_ADDRESS, "BaseTokenFactory".to_string());
+                labels.insert(BASE_POLICY_REGISTRY_ADDRESS, "BasePolicyRegistry".to_string());
+                labels
+                    .insert(BASE_ACTIVATION_REGISTRY_ADDRESS, "BaseActivationRegistry".to_string());
+            }
+            if upgrade >= BaseUpgrade::Cobalt {
+                labels.insert(BASE_TX_CONTEXT_ADDRESS, "BaseTxContext".to_string());
+                labels.insert(BASE_NONCE_MANAGER_ADDRESS, "BaseNonceManager".to_string());
+            }
         }
         labels
     }
@@ -283,13 +292,17 @@ impl NetworkConfigs {
             precompiles
                 .insert(PRECOMPILE_ID_CELO_TRANSFER.name().to_string(), CELO_TRANSFER_ADDRESS);
         }
-        if self.is_base() {
-            precompiles.insert("BaseTokenFactory".to_string(), BASE_TOKEN_FACTORY_ADDRESS);
-            precompiles.insert("BasePolicyRegistry".to_string(), BASE_POLICY_REGISTRY_ADDRESS);
-            precompiles
-                .insert("BaseActivationRegistry".to_string(), ActivationRegistryStorage::ADDRESS);
-            precompiles.insert("BaseTxContext".to_string(), BASE_TX_CONTEXT_ADDRESS);
-            precompiles.insert("BaseNonceManager".to_string(), BASE_NONCE_MANAGER_ADDRESS);
+        if let Some(upgrade) = self.base {
+            if upgrade >= BaseUpgrade::Beryl {
+                precompiles.insert("BaseTokenFactory".to_string(), BASE_TOKEN_FACTORY_ADDRESS);
+                precompiles.insert("BasePolicyRegistry".to_string(), BASE_POLICY_REGISTRY_ADDRESS);
+                precompiles
+                    .insert("BaseActivationRegistry".to_string(), BASE_ACTIVATION_REGISTRY_ADDRESS);
+            }
+            if upgrade >= BaseUpgrade::Cobalt {
+                precompiles.insert("BaseTxContext".to_string(), BASE_TX_CONTEXT_ADDRESS);
+                precompiles.insert("BaseNonceManager".to_string(), BASE_NONCE_MANAGER_ADDRESS);
+            }
         }
         precompiles
     }
@@ -299,13 +312,19 @@ impl NetworkConfigs {
     /// intentionally excluded because they are handled by the shared prefix
     /// dispatcher instead of individual singleton sentinels.
     pub fn base_precompile_sentinel_addresses(&self) -> &'static [Address] {
-        if self.is_base() { BASE_PRECOMPILE_SENTINEL_ADDRESSES } else { &[] }
+        match self.base {
+            Some(upgrade) if upgrade >= BaseUpgrade::Cobalt => BASE_PRECOMPILE_SENTINEL_ADDRESSES,
+            Some(upgrade) if upgrade >= BaseUpgrade::Beryl => {
+                &BASE_PRECOMPILE_SENTINEL_ADDRESSES[..3]
+            }
+            _ => &[],
+        }
     }
 
     /// `(address, slot, value)` writes that mark Base's activation-gated
     /// features active, so local `forge test --base` (no fork) matches a live
     /// Beryl+ chain instead of reverting `FeatureNotActivated`. Empty unless
-    /// `--base` is set.
+    /// `--base` is set to Beryl or later.
     ///
     /// Slot derivation MUST stay in lockstep with the `features` mapping in
     /// base/base `precompiles/src/activation/storage.rs`. That mapping lives at
@@ -314,7 +333,7 @@ impl NetworkConfigs {
     /// to `0x43ee..cce00`), and each feature flag sits at the Solidity mapping
     /// slot `keccak256(feature_id ‖ root)`.
     pub fn base_activation_seeds(&self) -> Vec<(Address, U256, U256)> {
-        if !self.is_base() {
+        if !matches!(self.base, Some(upgrade) if upgrade >= BaseUpgrade::Beryl) {
             return Vec::new();
         }
         // ERC-7201 root: keccak256(abi.encode(uint256(keccak256(id)) - 1)) & ~0xff.
@@ -344,6 +363,7 @@ impl NetworkConfigs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use revm::precompile::Precompiles;
 
     #[test]
     fn default_missing_value_matches_default_base_upgrade() {
@@ -377,5 +397,56 @@ mod tests {
 
         let networks = NetworkConfigs::default().with_chain_id(8453);
         assert_eq!(networks.base_upgrade(), Some(DEFAULT_BASE_UPGRADE));
+    }
+
+    #[test]
+    fn base_precompiles_are_gated_by_upgrade() {
+        let mut azul_map = PrecompilesMap::from_static(Precompiles::cancun());
+        let azul = NetworkConfigs::with_base_upgrade(BaseUpgrade::Azul);
+        azul.inject_precompiles(&mut azul_map);
+        assert!(azul_map.get(&BASE_TOKEN_FACTORY_ADDRESS).is_none());
+        assert!(azul_map.get(&BASE_POLICY_REGISTRY_ADDRESS).is_none());
+        assert!(azul_map.get(&BASE_ACTIVATION_REGISTRY_ADDRESS).is_none());
+        assert!(azul_map.get(&BASE_TX_CONTEXT_ADDRESS).is_none());
+        assert!(azul_map.get(&BASE_NONCE_MANAGER_ADDRESS).is_none());
+        assert!(azul.precompiles().is_empty());
+        assert!(azul.precompiles_label().is_empty());
+        assert!(azul.base_precompile_sentinel_addresses().is_empty());
+        assert!(azul.base_activation_seeds().is_empty());
+
+        let mut beryl_map = PrecompilesMap::from_static(Precompiles::cancun());
+        let beryl = NetworkConfigs::with_base_upgrade(BaseUpgrade::Beryl);
+        beryl.inject_precompiles(&mut beryl_map);
+        assert!(beryl_map.get(&BASE_TOKEN_FACTORY_ADDRESS).is_some());
+        assert!(beryl_map.get(&BASE_POLICY_REGISTRY_ADDRESS).is_some());
+        assert!(beryl_map.get(&BASE_ACTIVATION_REGISTRY_ADDRESS).is_some());
+        assert!(beryl_map.get(&BASE_TX_CONTEXT_ADDRESS).is_none());
+        assert!(beryl_map.get(&BASE_NONCE_MANAGER_ADDRESS).is_none());
+        assert_eq!(beryl.precompiles().len(), 3);
+        assert!(!beryl.precompiles().contains_key("BaseTxContext"));
+        assert!(!beryl.precompiles().contains_key("BaseNonceManager"));
+        assert_eq!(beryl.precompiles_label().len(), 3);
+        assert_eq!(
+            beryl.base_precompile_sentinel_addresses(),
+            &[
+                BASE_TOKEN_FACTORY_ADDRESS,
+                BASE_POLICY_REGISTRY_ADDRESS,
+                BASE_ACTIVATION_REGISTRY_ADDRESS,
+            ]
+        );
+        assert_eq!(beryl.base_activation_seeds().len(), 3);
+
+        let mut cobalt_map = PrecompilesMap::from_static(Precompiles::cancun());
+        let cobalt = NetworkConfigs::with_base_upgrade(BaseUpgrade::Cobalt);
+        cobalt.inject_precompiles(&mut cobalt_map);
+        assert!(cobalt_map.get(&BASE_TOKEN_FACTORY_ADDRESS).is_some());
+        assert!(cobalt_map.get(&BASE_POLICY_REGISTRY_ADDRESS).is_some());
+        assert!(cobalt_map.get(&BASE_ACTIVATION_REGISTRY_ADDRESS).is_some());
+        assert!(cobalt_map.get(&BASE_TX_CONTEXT_ADDRESS).is_some());
+        assert!(cobalt_map.get(&BASE_NONCE_MANAGER_ADDRESS).is_some());
+        assert_eq!(cobalt.precompiles().len(), 5);
+        assert_eq!(cobalt.precompiles_label().len(), 5);
+        assert_eq!(cobalt.base_precompile_sentinel_addresses(), BASE_PRECOMPILE_SENTINEL_ADDRESSES);
+        assert_eq!(cobalt.base_activation_seeds().len(), 3);
     }
 }
